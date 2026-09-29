@@ -103,6 +103,8 @@ pub struct ResponseViewer<'a> {
     pretty_scroll_x: usize,
     pretty_lines: Vec<String>,
     visual: bool,
+    anchored: bool,
+    cursor_initialized: bool,
     anchor: (usize, usize),
     cursor: (usize, usize),
     flash: Option<(String, std::time::Instant)>,
@@ -149,6 +151,8 @@ impl<'a> ResponseViewer<'a> {
             pretty_scroll_x: 0,
             pretty_lines: vec![],
             visual: false,
+            anchored: false,
+            cursor_initialized: false,
             anchor: (0, 0),
             cursor: (0, 0),
             flash: None,
@@ -192,8 +196,10 @@ impl<'a> ResponseViewer<'a> {
                 .collect()
         };
 
-        // a new response invalidates any pending selection
+        // a new response invalidates any pending selection and the cursor
+        // memory, positions of a previous body are meaningless now
         self.visual = false;
+        self.cursor_initialized = false;
         self.pretty_scroll_x = 0;
 
         // cache the raw body split on real line boundaries, CRLF line endings
@@ -514,7 +520,7 @@ impl<'a> ResponseViewer<'a> {
                     .iter()
                     .enumerate()
                     .map(|(idx, line)| {
-                        let reverse = self.cursor_rev_range(idx);
+                        let reverse = self.selection_rev_range(idx);
                         let styled = Line::from(line.clone());
                         slice_styled_line(&styled, self.raw_scroll_x, width, reverse)
                     })
@@ -667,7 +673,7 @@ impl<'a> ResponseViewer<'a> {
                         // highlight the char under the cursor when the visual
                         // selection is active, when sitting past the last char
                         // of a line we highlight the last char instead
-                        let reverse = self.cursor_rev_range(idx);
+                        let reverse = self.selection_rev_range(idx);
                         slice_styled_line(line, self.pretty_scroll_x, width, reverse)
                     })
                     .collect::<Vec<_>>()
@@ -687,36 +693,52 @@ impl<'a> ResponseViewer<'a> {
         }
     }
 
-    /// when the visual selection is active and given line index is the line
-    /// the cursor sits on, returns the char range the cursor cell covers
-    fn cursor_rev_range(&self, line_idx: usize) -> Option<(usize, usize)> {
-        if !self.visual || line_idx.ne(&self.cursor.0) {
+    /// when the visual selection is active, returns the char range of the
+    /// given line that falls within the selection, cursor char inclusive;
+    /// when the selection is zero-width it degenerates to the cursor cell
+    fn selection_rev_range(&self, line_idx: usize) -> Option<(usize, usize)> {
+        if !self.visual {
             return None;
         }
-        let lines = match self.active_tab {
-            ResViewerTabs::Preview => &self.pretty_lines,
-            _ => &self.raw_lines,
-        };
-        let line_len = lines
-            .get(line_idx)
-            .map(|line| line.chars().count())
-            .unwrap_or(0);
-        let col = self.cursor.1.min(line_len.saturating_sub(1));
-        Some((col, col.add(1)))
+        let start = self.anchor.min(self.cursor);
+        let end = self.anchor.max(self.cursor);
+
+        if line_idx.lt(&start.0) || line_idx.gt(&end.0) {
+            return None;
+        }
+
+        Some(if start.0.eq(&end.0) {
+            (start.1, end.1.add(1))
+        } else if line_idx.eq(&start.0) {
+            (start.1, usize::MAX)
+        } else if line_idx.eq(&end.0) {
+            (0, end.1.add(1))
+        } else {
+            (0, usize::MAX)
+        })
     }
 
-    /// toggles the visual selection, the cursor starts at the current top
-    /// left corner of the viewport so the first motion feels predictable
+    /// toggles the visual selection; right after entering, the cursor moves
+    /// around without a selection being drawn, until the anchor is dropped
+    /// with o, so the start can be positioned first; the cursor remembers
+    /// where the last selection left it, so consecutive selections pick up
+    /// from the same place
     fn toggle_visual(&mut self) {
         self.visual = !self.visual;
         if self.visual {
-            let (scroll_y, scroll_x) = match self.active_tab {
-                ResViewerTabs::Preview => (self.pretty_scroll, self.pretty_scroll_x),
-                _ => (self.raw_scroll, self.raw_scroll_x),
-            };
-            self.cursor = (scroll_y, scroll_x);
+            if !self.cursor_initialized {
+                let scroll_y = match self.active_tab {
+                    ResViewerTabs::Preview => self.pretty_scroll,
+                    _ => self.raw_scroll,
+                };
+                self.cursor = (scroll_y, 0);
+                self.cursor_initialized = true;
+            }
+            // the content may have changed since the last selection, so the
+            // cursor is clamped against the current content
             self.clamp_cursor();
             self.anchor = self.cursor;
+            self.anchored = false;
         }
     }
 
@@ -751,6 +773,11 @@ impl<'a> ResponseViewer<'a> {
             _ => self.cursor,
         };
         self.clamp_cursor();
+        // while the anchor hasn't been dropped yet the cursor moves around
+        // freely without drawing a selection, the anchor follows it
+        if !self.anchored {
+            self.anchor = self.cursor;
+        }
         self.follow_cursor();
     }
 
@@ -815,8 +842,7 @@ impl<'a> ResponseViewer<'a> {
     /// on the summary line; the source matches the active tab: the pretty
     /// body on the preview tab, the headers as `Key: Value` lines on the
     /// headers tab, the raw body on the raw tab; the cookies tab is still
-    /// under construction and has nothing to copy; selection-based copying
-    /// is on the way
+    /// under construction and has nothing to copy
     fn copy_response_body(&mut self) {
         let body = self
             .response
@@ -845,21 +871,59 @@ impl<'a> ResponseViewer<'a> {
                 }
             });
 
-        let flash = match body {
-            Some(body) if !body.is_empty() => {
-                match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(body))
-                {
-                    Ok(()) => "Copied to clipboard".to_string(),
-                    Err(e) => {
-                        tracing::error!("failed to copy response body to clipboard: {e}");
-                        format!("Failed to copy: {e}")
-                    }
+        match body {
+            Some(body) => self.copy_to_clipboard(body, "to clipboard"),
+            None => self.nothing_to_copy(),
+        }
+    }
+
+    /// extracts the text covered by the active selection: the first line from
+    /// the anchor column to its end, whole middle lines, and the last line up
+    /// to the cursor column, cursor char inclusive
+    fn selected_text(&self) -> Option<String> {
+        if !self.visual {
+            return None;
+        }
+        let lines = match self.active_tab {
+            ResViewerTabs::Preview => &self.pretty_lines,
+            _ => &self.raw_lines,
+        };
+        let (start, end) = (self.anchor.min(self.cursor), self.anchor.max(self.cursor));
+
+        let mut out: Vec<String> = vec![];
+        for idx in start.0..=end.0 {
+            let line = lines.get(idx)?;
+            let chars: Vec<char> = line.chars().collect();
+            let from = if idx.eq(&start.0) { start.1 } else { 0 };
+            let to = if idx.eq(&end.0) {
+                end.1.add(1).min(chars.len())
+            } else {
+                chars.len()
+            };
+            let from = from.min(chars.len());
+            out.push(chars[from..to.max(from)].iter().collect());
+        }
+        Some(out.join("\n"))
+    }
+
+    fn copy_to_clipboard(&mut self, text: String, label: &str) {
+        let flash = if text.is_empty() {
+            "Nothing to copy".to_string()
+        } else {
+            match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text))
+            {
+                Ok(()) => format!("Copied {label}"),
+                Err(e) => {
+                    tracing::error!("failed to copy to clipboard: {e}");
+                    format!("Failed to copy: {e}")
                 }
             }
-            _ => "Nothing to copy".to_string(),
         };
-
         self.flash = Some((flash, std::time::Instant::now()));
+    }
+
+    fn nothing_to_copy(&mut self) {
+        self.flash = Some(("Nothing to copy".to_string(), std::time::Instant::now()));
     }
 
     fn draw_summary(&mut self, frame: &mut Frame, size: Rect) {
@@ -968,6 +1032,18 @@ impl<'a> Eventful for ResponseViewer<'a> {
             }
         }
 
+        // while the visual selection is active o drops the anchor at the
+        // cursor; until the first o the selection stays collapsed on the
+        // cursor, and further o's reposition the start
+        if self.visual
+            && matches!(code, KeyCode::Char('o'))
+            && matches!(self.active_tab, ResViewerTabs::Preview | ResViewerTabs::Raw)
+        {
+            self.anchor = self.cursor;
+            self.anchored = true;
+            return Ok(None);
+        }
+
         // while the visual selection is active the motion keys move the
         // cursor instead of scrolling, the viewport follows the cursor
         if self.visual
@@ -1039,7 +1115,16 @@ impl<'a> Eventful for ResponseViewer<'a> {
                 }
                 ResViewerTabs::Cookies => {}
             },
-            KeyCode::Char('y') => self.copy_response_body(),
+            KeyCode::Char('y') => {
+                // while the visual selection is active y copies the selected
+                // text and exits the selection, otherwise the whole content
+                if let Some(text) = self.selected_text() {
+                    self.visual = false;
+                    self.copy_to_clipboard(text, "selection");
+                } else {
+                    self.copy_response_body();
+                }
+            }
             _ => {}
         }
 

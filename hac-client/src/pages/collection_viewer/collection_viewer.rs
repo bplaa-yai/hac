@@ -291,9 +291,9 @@ impl<'cv> CollectionViewer<'cv> {
 
         let hint = match self.layout.hint_pane.width {
             w if w.le(&100) => {
-                "[y -> copy] [v -> select] [j/k -> scroll] [tab -> change tab] [esc -> close]"
+                "[y -> copy] [v -> select] [o -> set start] [j/k -> scroll] [tab -> change tab] [esc -> close]"
             }
-            _ => "[y -> copy] [v -> select] [j/k -> scroll up/down] [h/l -> scroll sideways] [0/$ -> line start/end] [tab -> change tab] [esc -> close]",
+            _ => "[y -> copy] [v -> select] [o -> set start] [j/k -> scroll up/down] [h/l -> scroll sideways] [0/$ -> line start/end] [tab -> change tab] [esc -> close]",
         };
 
         frame.render_widget(
