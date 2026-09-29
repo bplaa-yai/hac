@@ -95,6 +95,8 @@ pub struct ResponseViewer<'a> {
     collection_store: Rc<RefCell<CollectionStore>>,
     active_tab: ResViewerTabs,
     raw_scroll: usize,
+    raw_scroll_x: usize,
+    raw_lines: Vec<String>,
     headers_scroll_y: usize,
     headers_scroll_x: usize,
     pretty_scroll: usize,
@@ -134,6 +136,8 @@ impl<'a> ResponseViewer<'a> {
             layout,
             active_tab: ResViewerTabs::Preview,
             raw_scroll: 0,
+            raw_scroll_x: 0,
+            raw_lines: vec![],
             headers_scroll_y: 0,
             headers_scroll_x: 0,
             pretty_scroll: 0,
@@ -165,6 +169,20 @@ impl<'a> ResponseViewer<'a> {
             self.tree = None;
             self.lines = vec![];
         }
+
+        // cache the raw body split on real line boundaries, CRLF line endings
+        // are stripped of the trailing carriage return so lines are clean;
+        // this is the source of truth for the raw tab and for selection
+        self.raw_lines = response
+            .as_ref()
+            .and_then(|res| res.borrow().body.clone())
+            .map(|body| {
+                body.split('\n')
+                    .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.raw_scroll_x = 0;
 
         if let Some(res) = response.as_ref() {
             let cause: String = res
@@ -448,18 +466,32 @@ impl<'a> ResponseViewer<'a> {
     }
 
     fn draw_raw_response(&mut self, frame: &mut Frame, size: Rect) {
-        if let Some(response) = self.response.as_ref() {
-            let lines = if response.borrow().body.is_some() {
-                response
-                    .borrow()
-                    .body
-                    .as_ref()
-                    .unwrap()
-                    .chars()
-                    .collect::<Vec<_>>()
-                    // accounting for the scrollbar width when splitting the lines
-                    .chunks(size.width.saturating_sub(2).into())
-                    .map(|row| Line::from(row.iter().collect::<String>()))
+        if self.response.is_some() {
+            let longest_line = self
+                .raw_lines
+                .iter()
+                .map(|line| line.chars().count())
+                .max()
+                .unwrap_or(0);
+
+            // clamp the horizontal scroll so we can never scroll past the
+            // longest line, the same way the headers tab does
+            if self.raw_scroll_x.ge(&longest_line.saturating_sub(1)) {
+                self.raw_scroll_x = longest_line.saturating_sub(1);
+            }
+
+            let lines = if !self.raw_lines.is_empty() {
+                let width = size.width.saturating_sub(2).into();
+                self.raw_lines
+                    .iter()
+                    .map(|line| {
+                        Line::from(
+                            line.chars()
+                                .skip(self.raw_scroll_x)
+                                .take(width)
+                                .collect::<String>(),
+                        )
+                    })
                     .collect::<Vec<_>>()
             } else {
                 vec![Line::from("No body").centered()]
@@ -469,6 +501,18 @@ impl<'a> ResponseViewer<'a> {
                 self.raw_scroll = lines.len().saturating_sub(1);
             }
 
+            let [raw_pane, x_scrollbar_pane] =
+                build_horizontal_scrollbar(self.preview_layout.content_pane);
+
+            // when the horizontal scrollbar is visible we lose one line of
+            // content, so we account for it
+            let lines_to_show =
+                if longest_line > self.preview_layout.content_pane.width as usize {
+                    raw_pane.height
+                } else {
+                    self.preview_layout.content_pane.height
+                };
+
             self.draw_scrollbar(
                 lines.len(),
                 self.raw_scroll,
@@ -476,11 +520,20 @@ impl<'a> ResponseViewer<'a> {
                 self.preview_layout.scrollbar,
             );
 
+            if longest_line > self.preview_layout.content_pane.width as usize {
+                self.draw_horizontal_scrollbar(
+                    longest_line,
+                    self.raw_scroll_x,
+                    frame,
+                    x_scrollbar_pane,
+                );
+            }
+
             let lines_in_view = lines
                 .into_iter()
                 .skip(self.raw_scroll)
                 .chain(iter::repeat(Line::from("~".fg(self.colors.bright.black))))
-                .take(size.height.into())
+                .take(lines_to_show as usize)
                 .collect::<Vec<_>>();
 
             let raw_response = Paragraph::new(lines_in_view);
@@ -698,17 +751,28 @@ impl<'a> Eventful for ResponseViewer<'a> {
         }
 
         match key_event.code {
-            KeyCode::Char('0') if self.active_tab.eq(&ResViewerTabs::Headers) => {
-                self.headers_scroll_x = 0;
-            }
-            KeyCode::Char('$') if self.active_tab.eq(&ResViewerTabs::Headers) => {
-                self.headers_scroll_x = usize::MAX;
-            }
-            KeyCode::Char('h') => {
-                if let ResViewerTabs::Headers = self.active_tab {
+            KeyCode::Char('0') => match self.active_tab {
+                ResViewerTabs::Headers => self.headers_scroll_x = 0,
+                ResViewerTabs::Raw => self.raw_scroll_x = 0,
+                _ => {}
+            },
+            KeyCode::Char('$') => match self.active_tab {
+                ResViewerTabs::Headers => self.headers_scroll_x = usize::MAX,
+                ResViewerTabs::Raw => self.raw_scroll_x = usize::MAX,
+                _ => {}
+            },
+            KeyCode::Char('h') => match self.active_tab {
+                ResViewerTabs::Headers => {
                     self.headers_scroll_x = self.headers_scroll_x.saturating_sub(1)
                 }
-            }
+                ResViewerTabs::Raw => self.raw_scroll_x = self.raw_scroll_x.saturating_sub(1),
+                _ => {}
+            },
+            KeyCode::Char('l') => match self.active_tab {
+                ResViewerTabs::Headers => self.headers_scroll_x = self.headers_scroll_x.add(1),
+                ResViewerTabs::Raw => self.raw_scroll_x = self.raw_scroll_x.add(1),
+                _ => {}
+            },
             KeyCode::Char('j') => match self.active_tab {
                 ResViewerTabs::Preview => self.pretty_scroll = self.pretty_scroll.add(1),
                 ResViewerTabs::Raw => self.raw_scroll = self.raw_scroll.add(1),
@@ -723,11 +787,6 @@ impl<'a> Eventful for ResponseViewer<'a> {
                 }
                 ResViewerTabs::Cookies => {}
             },
-            KeyCode::Char('l') => {
-                if let ResViewerTabs::Headers = self.active_tab {
-                    self.headers_scroll_x = self.headers_scroll_x.add(1)
-                }
-            }
             KeyCode::Char('y') => self.copy_response_body(),
             _ => {}
         }

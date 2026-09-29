@@ -17,7 +17,7 @@ use std::rc::Rc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Stylize;
-use ratatui::widgets::{Block, Clear};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -275,6 +275,32 @@ impl<'cv> CollectionViewer<'cv> {
             .borrow_mut()
             .dispatch(CollectionStoreAction::SetFocusedPane(pane_to_focus));
     }
+
+    /// draws the shortcuts of the focused pane on the hint bar at the bottom,
+    /// currently only the response pane exposes shortcuts here
+    fn draw_hint(&self, frame: &mut Frame) {
+        let is_response_focused = self
+            .collection_store
+            .borrow()
+            .get_selected_pane()
+            .is_some_and(|pane| pane.eq(&PaneFocus::Preview));
+
+        if !is_response_focused {
+            return;
+        }
+
+        let hint = match self.layout.hint_pane.width {
+            w if w.le(&100) => {
+                "[y -> copy] [j/k -> scroll] [tab -> change tab] [esc -> close]"
+            }
+            _ => "[y -> copy] [j/k -> scroll up/down] [h/l -> scroll sideways] [0/$ -> line start/end] [tab -> change tab] [esc -> close]",
+        };
+
+        frame.render_widget(
+            Paragraph::new(hint).fg(self.colors.bright.black).centered(),
+            self.layout.hint_pane,
+        );
+    }
 }
 
 impl Renderable for CollectionViewer<'_> {
@@ -292,6 +318,8 @@ impl Renderable for CollectionViewer<'_> {
             .draw(frame, self.layout.response_preview)?;
         self.request_editor.draw(frame, self.layout.req_editor)?;
         self.request_uri.draw(frame, self.layout.req_uri)?;
+
+        self.draw_hint(frame);
 
         let overlay = self.collection_store.borrow().peek_overlay();
         match overlay {
