@@ -107,6 +107,7 @@ pub struct ResponseViewer<'a> {
     cursor_initialized: bool,
     anchor: (usize, usize),
     cursor: (usize, usize),
+    headers_selected: Option<usize>,
     flash: Option<(String, std::time::Instant)>,
 }
 
@@ -155,6 +156,7 @@ impl<'a> ResponseViewer<'a> {
             cursor_initialized: false,
             anchor: (0, 0),
             cursor: (0, 0),
+            headers_selected: None,
             flash: None,
             collection_store,
         }
@@ -200,6 +202,7 @@ impl<'a> ResponseViewer<'a> {
         // memory, positions of a previous body are meaningless now
         self.visual = false;
         self.cursor_initialized = false;
+        self.headers_selected = None;
         self.pretty_scroll_x = 0;
 
         // cache the raw body split on real line boundaries, CRLF line endings
@@ -420,27 +423,36 @@ impl<'a> ResponseViewer<'a> {
                     Line::from(""),
                 ];
 
-                for (name, value) in headers {
-                    if let Ok(value) = value.to_str() {
-                        let name_string = name.to_string();
-                        let aux = name_string.len().max(value.len());
-                        longest_line = aux.max(longest_line);
-                        lines.push(Line::from(
-                            name_string
-                                .chars()
-                                .skip(self.headers_scroll_x)
-                                .collect::<String>()
-                                .bold()
-                                .yellow(),
-                        ));
-                        lines.push(Line::from(
-                            value
-                                .chars()
-                                .skip(self.headers_scroll_x)
-                                .collect::<String>(),
-                        ));
-                        lines.push(Line::from(""));
-                    }
+                for (rendered_idx, (name, value)) in headers
+                    .iter()
+                    .filter(|(_, value)| value.to_str().is_ok())
+                    .enumerate()
+                {
+                    let name_string = name.to_string();
+                    let value = value.to_str().expect("filtered to valid UTF-8 values");
+                    let aux = name_string.len().max(value.len());
+                    longest_line = aux.max(longest_line);
+                    lines.push(Line::from(
+                        name_string
+                            .chars()
+                            .skip(self.headers_scroll_x)
+                            .collect::<String>()
+                            .bold()
+                            .yellow(),
+                    ));
+                    let value_text = value
+                        .chars()
+                        .skip(self.headers_scroll_x)
+                        .collect::<String>();
+                    // the selected header has its value highlighted
+                    let value_line =
+                        if self.headers_selected.is_some_and(|idx| idx.eq(&rendered_idx)) {
+                            Line::from(value_text.reversed())
+                        } else {
+                            Line::from(value_text)
+                        };
+                    lines.push(value_line);
+                    lines.push(Line::from(""));
                 }
 
                 if self
@@ -742,6 +754,70 @@ impl<'a> ResponseViewer<'a> {
         }
     }
 
+    /// the values of the headers rendered on the headers tab, in wire order;
+    /// non UTF-8 values are skipped exactly like the rendering does, so the
+    /// selection index can never desync from the screen
+    fn rendered_headers(&self) -> Vec<String> {
+        self.response
+            .as_ref()
+            .and_then(|res| res.borrow().headers.as_ref().map(|headers| {
+                headers
+                    .iter()
+                    .filter_map(|(_, value)| value.to_str().ok().map(str::to_string))
+                    .collect()
+            }))
+            .unwrap_or_default()
+    }
+
+    /// toggles the header-selection mode of the headers tab, selection moves
+    /// whole headers at a time and the value is what gets copied; entering
+    /// picks the first header visible under the current scroll
+    fn toggle_header_selection(&mut self) {
+        self.headers_selected = match self.headers_selected {
+            Some(_) => None,
+            None => {
+                let count = self.rendered_headers().len();
+                if count.eq(&0) {
+                    None
+                } else {
+                    let first_visible = self.headers_scroll_y.saturating_sub(2) / 3;
+                    Some(first_visible.min(count.sub(1)))
+                }
+            }
+        };
+    }
+
+    /// moves the header selection up or down one whole header
+    fn move_header_selection(&mut self, code: KeyCode) {
+        let count = self.rendered_headers().len();
+        let Some(idx) = self.headers_selected else {
+            return;
+        };
+        self.headers_selected = Some(match code {
+            KeyCode::Char('j') => idx.add(1).min(count.saturating_sub(1)),
+            KeyCode::Char('k') => idx.saturating_sub(1),
+            _ => idx,
+        });
+        self.follow_header_selection();
+    }
+
+    /// scrolls the headers tab so the selected header's name and value stay
+    /// visible, every header takes three lines
+    fn follow_header_selection(&mut self) {
+        let Some(idx) = self.headers_selected else {
+            return;
+        };
+        let name_line = idx * 3 + 2;
+        let value_line = name_line + 1;
+        // one line may be taken by the horizontal scrollbar
+        let visible = (self.preview_layout.content_pane.height as usize).saturating_sub(1);
+        if name_line.lt(&self.headers_scroll_y) {
+            self.headers_scroll_y = name_line;
+        } else if value_line.ge(&self.headers_scroll_y.add(visible)) {
+            self.headers_scroll_y = name_line;
+        }
+    }
+
     /// clamps the cursor to the content of the active tab; the cursor always
     /// sits on a real char, never on the virtual end of a line, so every
     /// motion is visible
@@ -1017,19 +1093,34 @@ impl<'a> Eventful for ResponseViewer<'a> {
         };
 
         if let KeyCode::Esc = code {
-            // while the visual selection is active esc cancels it instead of
-            // leaving the pane
-            if self.visual {
+            // while a selection is active esc cancels it instead of leaving
+            // the pane
+            if self.visual || self.headers_selected.is_some() {
                 self.visual = false;
+                self.headers_selected = None;
                 return Ok(None);
             }
             return Ok(Some(ResponseViewerEvent::RemoveSelection));
         }
 
         if let KeyCode::Char('v') = code {
-            if matches!(self.active_tab, ResViewerTabs::Preview | ResViewerTabs::Raw) {
-                self.toggle_visual();
+            match self.active_tab {
+                ResViewerTabs::Preview | ResViewerTabs::Raw => self.toggle_visual(),
+                // on the headers tab the selection moves whole headers and
+                // the value is what gets highlighted and copied
+                ResViewerTabs::Headers => self.toggle_header_selection(),
+                ResViewerTabs::Cookies => {}
             }
+        }
+
+        // the header-selection only responds to up/down, horizontal panning
+        // keeps its scrolling role while a value is highlighted
+        if self.headers_selected.is_some()
+            && matches!(self.active_tab, ResViewerTabs::Headers)
+            && matches!(code, KeyCode::Char('j') | KeyCode::Char('k'))
+        {
+            self.move_header_selection(code);
+            return Ok(None);
         }
 
         // while the visual selection is active o drops the anchor at the
@@ -1064,11 +1155,13 @@ impl<'a> Eventful for ResponseViewer<'a> {
 
         if let KeyCode::Tab = code {
             self.visual = false;
+            self.headers_selected = None;
             self.active_tab = ResViewerTabs::next(&self.active_tab);
         }
 
         if let KeyCode::BackTab = key_event.code {
             self.visual = false;
+            self.headers_selected = None;
             self.active_tab = ResViewerTabs::prev(&self.active_tab);
         }
 
@@ -1116,9 +1209,17 @@ impl<'a> Eventful for ResponseViewer<'a> {
                 ResViewerTabs::Cookies => {}
             },
             KeyCode::Char('y') => {
-                // while the visual selection is active y copies the selected
-                // text and exits the selection, otherwise the whole content
-                if let Some(text) = self.selected_text() {
+                // while a selection is active y copies it and exits the
+                // selection, otherwise the whole content
+                if let Some(idx) = self.headers_selected {
+                    self.headers_selected = None;
+                    let value = self
+                        .rendered_headers()
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.copy_to_clipboard(value, "selection");
+                } else if let Some(text) = self.selected_text() {
                     self.visual = false;
                     self.copy_to_clipboard(text, "selection");
                 } else {
