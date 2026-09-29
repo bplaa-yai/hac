@@ -1396,7 +1396,11 @@ fn make_empty_ascii_art(colors: &hac_colors::Colors) -> Vec<Line<'static>> {
 
 #[cfg(test)]
 mod tests {
+    use hac_colors::Colors;
+    use hac_core::collection::types::{Collection, Info};
+    use hac_core::text_object::TextObject;
     use rand::{rngs::StdRng, SeedableRng};
+    use ratatui::{backend::TestBackend, Terminal};
 
     use super::*;
     #[test]
@@ -1428,5 +1432,421 @@ mod tests {
         let art = get_error_ascii_art(big_enough, &mut rng);
 
         assert_eq!(art, expected);
+    }
+
+    // ------------------------------------------------------------------
+    // helpers
+    // ------------------------------------------------------------------
+
+    fn make_response(body: &str, pretty_body: &str) -> Response {
+        Response {
+            body: Some(body.to_string()),
+            pretty_body: Some(TextObject::from(pretty_body)),
+            headers: None,
+            duration: std::time::Duration::from_millis(10),
+            status: None,
+            headers_size: None,
+            body_size: None,
+            size: None,
+            is_error: false,
+            cause: None,
+        }
+    }
+
+    fn make_viewer(body: &str, pretty_body: &str) -> ResponseViewer<'static> {
+        let colors: &'static Colors = Box::leak(Box::new(Colors::default()));
+        let response = Rc::new(RefCell::new(make_response(body, pretty_body)));
+        let mut viewer = ResponseViewer::new(
+            colors,
+            Rc::new(RefCell::new(CollectionStore::default())),
+            Some(response.clone()),
+            Rect::new(0, 0, 80, 24),
+        );
+        viewer.update(Some(response));
+        viewer
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn draw_and_collect(viewer: &mut ResponseViewer) -> (String, usize) {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("failed to build backend");
+        terminal
+            .draw(|frame| {
+                let size = frame.size();
+                _ = viewer.draw(frame, size);
+            })
+            .expect("failed to draw the viewer");
+
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect::<String>();
+        let reversed = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.modifier.contains(Modifier::REVERSED))
+            .count();
+        (text, reversed)
+    }
+
+    // ------------------------------------------------------------------
+    // slice_styled_line
+    // ------------------------------------------------------------------
+
+    fn two_span_line() -> Line<'static> {
+        Line::from(vec![
+            Span::from("hello "),
+            Span::from("world".fg(self::tests::TEST_COLOR)),
+        ])
+    }
+
+    const TEST_COLOR: ratatui::style::Color = ratatui::style::Color::Yellow;
+
+    #[test]
+    fn test_slice_styled_line_identity() {
+        let line = two_span_line();
+        let sliced = slice_styled_line(&line, 0, 100, None);
+        assert_eq!(sliced.spans.len(), 2);
+        assert_eq!(sliced.spans[0].content, "hello ");
+        assert_eq!(sliced.spans[1].content, "world");
+    }
+
+    #[test]
+    fn test_slice_styled_line_offset() {
+        let line = two_span_line();
+        let sliced = slice_styled_line(&line, 3, 100, None);
+        assert_eq!(sliced.spans.len(), 2);
+        assert_eq!(sliced.spans[0].content, "lo ");
+        assert_eq!(sliced.spans[1].content, "world");
+    }
+
+    #[test]
+    fn test_slice_styled_line_reverse_mid_span() {
+        let line = two_span_line();
+        let sliced = slice_styled_line(&line, 0, 100, Some((7, 9)));
+        // the reversed range sits inside the second span, which is split
+        // around it
+        assert_eq!(sliced.spans.len(), 4);
+        assert_eq!(sliced.spans[0].content, "hello ");
+        assert!(!sliced.spans[0].style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(sliced.spans[1].content, "w");
+        assert!(!sliced.spans[1].style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(sliced.spans[2].content, "or");
+        assert!(sliced.spans[2].style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(sliced.spans[3].content, "ld");
+    }
+
+    #[test]
+    fn test_slice_styled_line_reverse_cross_span() {
+        let line = two_span_line();
+        // the range covers the end of the first span and the start of the second
+        let sliced = slice_styled_line(&line, 0, 100, Some((4, 8)));
+        assert_eq!(sliced.spans.len(), 4);
+        assert_eq!(sliced.spans[0].content, "hell");
+        assert!(!sliced.spans[0].style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(sliced.spans[1].content, "o ");
+        assert!(sliced.spans[1].style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(sliced.spans[2].content, "wo");
+        assert!(sliced.spans[2].style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(sliced.spans[3].content, "rld");
+    }
+
+    #[test]
+    fn test_slice_styled_line_slice_and_reverse() {
+        let line = two_span_line();
+        // the viewport starts inside the reversed range, cutting it in half
+        let sliced = slice_styled_line(&line, 5, 4, Some((4, 8)));
+        assert_eq!(sliced.spans.len(), 3);
+        assert_eq!(sliced.spans[0].content, " ");
+        assert!(sliced.spans[0].style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(sliced.spans[1].content, "wo");
+        assert!(sliced.spans[1].style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(sliced.spans[2].content, "r");
+        assert!(!sliced.spans[2].style.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn test_slice_styled_line_utf8_is_char_based() {
+        let line = Line::from(Span::from("héllo"));
+        // the é is one char but two bytes, columns count chars
+        let sliced = slice_styled_line(&line, 1, 3, None);
+        assert_eq!(sliced.spans[0].content, "éll");
+        let sliced = slice_styled_line(&line, 0, 100, Some((1, 2)));
+        assert_eq!(sliced.spans[1].content, "é");
+        assert!(sliced.spans[1].style.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    // ------------------------------------------------------------------
+    // scrollbar_position
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_scrollbar_position_zero_content() {
+        assert_eq!(scrollbar_position(5, 0, 10), 0);
+    }
+
+    #[test]
+    fn test_scrollbar_position_fits_viewport() {
+        assert_eq!(scrollbar_position(3, 40, 80), 0);
+    }
+
+    #[test]
+    fn test_scrollbar_position_proportional() {
+        // scroll 40 of a max of 80 maps to half of content_length - 1
+        assert_eq!(scrollbar_position(40, 100, 20), 49);
+    }
+
+    #[test]
+    fn test_scrollbar_position_full_travel() {
+        // the max scroll maps to content_length - 1 so the thumb reaches
+        // the end of the track
+        assert_eq!(scrollbar_position(80, 100, 20), 99);
+    }
+
+    #[test]
+    fn test_scrollbar_position_overshoot_is_clamped() {
+        assert_eq!(scrollbar_position(usize::MAX, 100, 20), 99);
+    }
+
+    // ------------------------------------------------------------------
+    // visual selection state
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_visual_selection_collapsed_until_anchor() {
+        let mut viewer = make_viewer(r#"{"a":"b"}"#, "{\n  \"a\": \"b\"\n}");
+
+        viewer.handle_key_event(key(KeyCode::Char('v'))).unwrap();
+        assert!(viewer.visual);
+        // while unanchored the selection stays collapsed on the cursor, the
+        // first line of the pretty body is "{"
+        assert_eq!(viewer.selected_text().unwrap(), "{");
+
+        // move to the next line, still collapsed
+        viewer.handle_key_event(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(viewer.selected_text().unwrap(), " ");
+
+        // dropping the anchor and extending starts the actual selection
+        viewer.handle_key_event(key(KeyCode::Char('o'))).unwrap();
+        viewer
+            .handle_key_event(key(KeyCode::Char('l')))
+            .unwrap();
+        viewer
+            .handle_key_event(key(KeyCode::Char('l')))
+            .unwrap();
+        assert_eq!(viewer.selected_text().unwrap(), "  \"");
+    }
+
+    #[test]
+    fn test_dollar_lands_on_last_char_and_h_moves() {
+        let mut viewer = make_viewer(r#"{"a":"b"}"#, "{\n  \"a\": \"b\"\n}");
+        viewer.active_tab = ResViewerTabs::Preview;
+
+        viewer.handle_key_event(key(KeyCode::Char('v'))).unwrap();
+        viewer.handle_key_event(key(KeyCode::Char('j'))).unwrap();
+        viewer.handle_key_event(key(KeyCode::Char('$'))).unwrap();
+
+        // the cursor sits on the last char, not on the virtual end of line
+        let line_len = viewer.pretty_lines[1].chars().count();
+        assert_eq!(viewer.cursor, (1, line_len.sub(1)));
+
+        // and moving left is immediately visible
+        viewer.handle_key_event(key(KeyCode::Char('h'))).unwrap();
+        assert_eq!(viewer.cursor.1, line_len.sub(2));
+    }
+
+    #[test]
+    fn test_selected_text_multiline_partial() {
+        let mut viewer = make_viewer(r#"{"a":"b"}"#, "{\n  \"a\": \"b\"\n}");
+        viewer.visual = true;
+        viewer.anchored = true;
+        viewer.anchor = (0, 1);
+        viewer.cursor = (2, 0);
+
+        // first line from the anchor to its end, whole middle line, last
+        // line up to the cursor, cursor char inclusive
+        assert_eq!(
+            viewer.selected_text().unwrap(),
+            "\n  \"a\": \"b\"\n}"
+        );
+    }
+
+    #[test]
+    fn test_follow_cursor_edges() {
+        // a raw body long enough to scroll both axes
+        let long_line = "x".repeat(200);
+        let body = (0..40)
+            .map(|i| if i.eq(&0) { long_line.clone() } else { format!("line-{i}") })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut viewer = make_viewer(&body, "");
+        viewer.active_tab = ResViewerTabs::Raw;
+
+        // moving below the viewport scrolls the cursor into view
+        viewer.visual = true;
+        viewer.cursor = (30, 0);
+        viewer.follow_cursor();
+        let height = viewer.preview_layout.content_pane.height as usize;
+        assert_eq!(viewer.raw_scroll, 30.sub(height.sub(1)));
+
+        // moving left past the edge snaps the viewport to the cursor
+        viewer.cursor = (30, 10);
+        viewer.raw_scroll_x = 50;
+        viewer.follow_cursor();
+        assert_eq!(viewer.raw_scroll_x, 10);
+
+        // moving right past the edge scrolls just enough to keep it visible
+        viewer.cursor = (30, 100);
+        viewer.follow_cursor();
+        let width = viewer.viewport_width();
+        assert_eq!(viewer.raw_scroll_x, 100.sub(width.sub(1)));
+    }
+
+    #[test]
+    fn test_y_exits_the_selection() {
+        let mut viewer = make_viewer(r#"{"a":"b"}"#, "{\n  \"a\": \"b\"\n}");
+
+        viewer.handle_key_event(key(KeyCode::Char('v'))).unwrap();
+        assert!(viewer.visual);
+        // the clipboard itself may fail on headless environments, so only
+        // the state transition is asserted
+        viewer.handle_key_event(key(KeyCode::Char('y'))).unwrap();
+        assert!(!viewer.visual);
+    }
+
+    // ------------------------------------------------------------------
+    // header selection
+    // ------------------------------------------------------------------
+
+    fn make_headers_response() -> Response {
+        let mut response = make_response("{}", "{}");
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("Good-One", reqwest::header::HeaderValue::from_static("value-one"));
+        headers.insert("Good-Two", reqwest::header::HeaderValue::from_static("value-two"));
+        headers.insert(
+            "Bad-Non-Utf8",
+            reqwest::header::HeaderValue::from_bytes(&[0xff, 0xfe]).expect("invalid header value"),
+        );
+        response.headers = Some(headers);
+        response
+    }
+
+    #[test]
+    fn test_rendered_headers_filters_non_utf8() {
+        let colors: &'static Colors = Box::leak(Box::new(Colors::default()));
+        let response = Rc::new(RefCell::new(make_headers_response()));
+        let mut viewer = ResponseViewer::new(
+            colors,
+            Rc::new(RefCell::new(CollectionStore::default())),
+            Some(response.clone()),
+            Rect::new(0, 0, 80, 24),
+        );
+        viewer.update(Some(response));
+        viewer.active_tab = ResViewerTabs::Headers;
+
+        // non UTF-8 values are skipped exactly like the rendering does
+        assert_eq!(viewer.rendered_headers(), vec!["value-one", "value-two"]);
+    }
+
+    #[test]
+    fn test_header_selection_navigation() {
+        let colors: &'static Colors = Box::leak(Box::new(Colors::default()));
+        let response = Rc::new(RefCell::new(make_headers_response()));
+        let mut viewer = ResponseViewer::new(
+            colors,
+            Rc::new(RefCell::new(CollectionStore::default())),
+            Some(response.clone()),
+            Rect::new(0, 0, 80, 24),
+        );
+        viewer.update(Some(response));
+        viewer.active_tab = ResViewerTabs::Headers;
+
+        viewer.handle_key_event(key(KeyCode::Char('v'))).unwrap();
+        assert_eq!(viewer.headers_selected, Some(0));
+
+        viewer.handle_key_event(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(viewer.headers_selected, Some(1));
+
+        // the selection clamps on the last rendered header
+        viewer.handle_key_event(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(viewer.headers_selected, Some(1));
+
+        viewer.handle_key_event(key(KeyCode::Char('k'))).unwrap();
+        assert_eq!(viewer.headers_selected, Some(0));
+
+        // y copies the highlighted value and exits the selection
+        viewer.handle_key_event(key(KeyCode::Char('j'))).unwrap();
+        viewer.handle_key_event(key(KeyCode::Char('y'))).unwrap();
+        assert_eq!(viewer.headers_selected, None);
+    }
+
+    #[test]
+    fn test_follow_header_selection_stride() {
+        let mut viewer = make_viewer("{}", "{}");
+        viewer.active_tab = ResViewerTabs::Headers;
+        viewer.headers_selected = Some(5);
+
+        // every header takes three lines, the name line of the 6th header is
+        // 2 + 5 * 3 = 17; scrolled past it we scroll back to it
+        viewer.headers_scroll_y = 30;
+        viewer.follow_header_selection();
+        assert_eq!(viewer.headers_scroll_y, 17);
+
+        // when the value line would fall off the bottom we scroll so the
+        // name is at the top again
+        viewer.headers_scroll_y = 0;
+        viewer.follow_header_selection();
+        assert_eq!(viewer.headers_scroll_y, 17);
+    }
+
+    // ------------------------------------------------------------------
+    // rendering
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_draw_shows_selection_highlight() {
+        // drawing consults the collection store for the pane focus state,
+        // so the store needs an actual state
+        let store = Rc::new(RefCell::new(CollectionStore::default()));
+        store.borrow_mut().set_state(Collection {
+            info: Info {
+                name: "test".to_string(),
+                description: None,
+            },
+            requests: None,
+            path: std::path::PathBuf::default(),
+        });
+
+        let colors: &'static Colors = Box::leak(Box::new(Colors::default()));
+        let response = Rc::new(RefCell::new(make_response(r#"{"a":"b"}"#, "{\n  \"a\": \"b\"\n}")));
+        let mut viewer = ResponseViewer::new(
+            colors,
+            store,
+            Some(response.clone()),
+            Rect::new(0, 0, 80, 24),
+        );
+        viewer.update(Some(response));
+
+        // without a selection nothing is highlighted
+        let (text, reversed) = draw_and_collect(&mut viewer);
+        assert!(text.contains("a"));
+        assert_eq!(reversed, 0);
+
+        // entering visual mode highlights the cursor cell
+        viewer.handle_key_event(key(KeyCode::Char('v'))).unwrap();
+        let (_, reversed) = draw_and_collect(&mut viewer);
+        assert_eq!(reversed, 1);
+
+        // and extending the selection highlights the covered chars
+        viewer.handle_key_event(key(KeyCode::Char('j'))).unwrap();
+        viewer.handle_key_event(key(KeyCode::Char('o'))).unwrap();
+        viewer.handle_key_event(key(KeyCode::Char('$'))).unwrap();
+        let (_, reversed) = draw_and_collect(&mut viewer);
+        // the selection covers the whole second line of the pretty body
+        assert_eq!(reversed, viewer.pretty_lines[1].chars().count());
     }
 }
