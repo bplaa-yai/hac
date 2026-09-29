@@ -15,7 +15,7 @@ use std::rc::Rc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rand::Rng;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Style, Stylize};
+use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Scrollbar};
 use ratatui::widgets::{ScrollbarOrientation, ScrollbarState, Tabs};
@@ -100,6 +100,11 @@ pub struct ResponseViewer<'a> {
     headers_scroll_y: usize,
     headers_scroll_x: usize,
     pretty_scroll: usize,
+    pretty_scroll_x: usize,
+    pretty_lines: Vec<String>,
+    visual: bool,
+    anchor: (usize, usize),
+    cursor: (usize, usize),
     flash: Option<(String, std::time::Instant)>,
 }
 
@@ -141,6 +146,11 @@ impl<'a> ResponseViewer<'a> {
             headers_scroll_y: 0,
             headers_scroll_x: 0,
             pretty_scroll: 0,
+            pretty_scroll_x: 0,
+            pretty_lines: vec![],
+            visual: false,
+            anchor: (0, 0),
+            cursor: (0, 0),
             flash: None,
             collection_store,
         }
@@ -169,6 +179,22 @@ impl<'a> ResponseViewer<'a> {
             self.tree = None;
             self.lines = vec![];
         }
+
+        // cache the pretty body split on real line boundaries the same way we
+        // cache the raw body; this is the substrate for selection on the
+        // preview tab and must stay aligned with the styled lines
+        self.pretty_lines = if body_str.is_empty() {
+            vec![]
+        } else {
+            body_str
+                .split('\n')
+                .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
+                .collect()
+        };
+
+        // a new response invalidates any pending selection
+        self.visual = false;
+        self.pretty_scroll_x = 0;
 
         // cache the raw body split on real line boundaries, CRLF line endings
         // are stripped of the trailing carriage return so lines are clean;
@@ -451,6 +477,7 @@ impl<'a> ResponseViewer<'a> {
                     self.draw_horizontal_scrollbar(
                         longest_line,
                         self.headers_scroll_x,
+                        x_scrollbar_pane.width as usize,
                         frame,
                         x_scrollbar_pane,
                     );
@@ -465,7 +492,7 @@ impl<'a> ResponseViewer<'a> {
         }
     }
 
-    fn draw_raw_response(&mut self, frame: &mut Frame, size: Rect) {
+    fn draw_raw_response(&mut self, frame: &mut Frame, _size: Rect) {
         if self.response.is_some() {
             let longest_line = self
                 .raw_lines
@@ -474,23 +501,22 @@ impl<'a> ResponseViewer<'a> {
                 .max()
                 .unwrap_or(0);
 
-            // clamp the horizontal scroll so we can never scroll past the
-            // longest line, the same way the headers tab does
-            if self.raw_scroll_x.ge(&longest_line.saturating_sub(1)) {
-                self.raw_scroll_x = longest_line.saturating_sub(1);
+            // clamp the horizontal scroll so `$` lands with the end of the
+            // longest line at the right edge of the panel
+            let max_scroll_x = longest_line.saturating_sub(self.viewport_width());
+            if self.raw_scroll_x.gt(&max_scroll_x) {
+                self.raw_scroll_x = max_scroll_x;
             }
 
             let lines = if !self.raw_lines.is_empty() {
-                let width = size.width.saturating_sub(2).into();
+                let width = self.viewport_width();
                 self.raw_lines
                     .iter()
-                    .map(|line| {
-                        Line::from(
-                            line.chars()
-                                .skip(self.raw_scroll_x)
-                                .take(width)
-                                .collect::<String>(),
-                        )
+                    .enumerate()
+                    .map(|(idx, line)| {
+                        let reverse = self.cursor_rev_range(idx);
+                        let styled = Line::from(line.clone());
+                        slice_styled_line(&styled, self.raw_scroll_x, width, reverse)
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -523,7 +549,8 @@ impl<'a> ResponseViewer<'a> {
             if longest_line > self.preview_layout.content_pane.width as usize {
                 self.draw_horizontal_scrollbar(
                     longest_line,
-                    self.raw_scroll_x,
+                    scrollbar_position(self.raw_scroll_x, longest_line, self.viewport_width()),
+                    self.viewport_width(),
                     frame,
                     x_scrollbar_pane,
                 );
@@ -562,10 +589,13 @@ impl<'a> ResponseViewer<'a> {
         &self,
         total_columns: usize,
         current_scroll: usize,
+        viewport_length: usize,
         frame: &mut Frame,
         size: Rect,
     ) {
-        let mut scrollbar_state = ScrollbarState::new(total_columns).position(current_scroll);
+        let mut scrollbar_state = ScrollbarState::new(total_columns)
+            .viewport_content_length(viewport_length)
+            .position(current_scroll);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
             .style(Style::default().fg(self.colors.normal.red))
@@ -575,21 +605,72 @@ impl<'a> ResponseViewer<'a> {
         frame.render_stateful_widget(scrollbar, size, &mut scrollbar_state);
     }
 
-    fn draw_pretty_response(&mut self, frame: &mut Frame, size: Rect) {
+    fn draw_pretty_response(&mut self, frame: &mut Frame, _size: Rect) {
         if self.response.as_ref().is_some() {
+            let longest_line = self
+                .pretty_lines
+                .iter()
+                .map(|line| line.chars().count())
+                .max()
+                .unwrap_or(0);
+
+            // clamp the horizontal scroll so `$` lands with the end of the
+            // longest line at the right edge of the panel
+            let max_scroll_x = longest_line.saturating_sub(self.viewport_width());
+            if self.pretty_scroll_x.gt(&max_scroll_x) {
+                self.pretty_scroll_x = max_scroll_x;
+            }
+
             if self.pretty_scroll.ge(&self.lines.len().saturating_sub(1)) {
                 self.pretty_scroll = self.lines.len().saturating_sub(1);
             }
 
+            let [pretty_pane, x_scrollbar_pane] =
+                build_horizontal_scrollbar(self.preview_layout.content_pane);
+
+            // when the horizontal scrollbar is visible we lose one line of
+            // content, so we account for it
+            let lines_to_show =
+                if longest_line > self.preview_layout.content_pane.width as usize {
+                    pretty_pane.height
+                } else {
+                    self.preview_layout.content_pane.height
+                };
+
             self.draw_scrollbar(
                 self.lines.len(),
-                self.raw_scroll,
+                self.pretty_scroll,
                 frame,
                 self.preview_layout.scrollbar,
             );
 
+            if longest_line > self.preview_layout.content_pane.width as usize {
+                self.draw_horizontal_scrollbar(
+                    longest_line,
+                    scrollbar_position(
+                        self.pretty_scroll_x,
+                        longest_line,
+                        self.viewport_width(),
+                    ),
+                    self.viewport_width(),
+                    frame,
+                    x_scrollbar_pane,
+                );
+            }
+
+            let width = self.viewport_width();
             let lines = if self.lines.len().gt(&0) {
-                self.lines.clone()
+                self.lines
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, line)| {
+                        // highlight the char under the cursor when the visual
+                        // selection is active, when sitting past the last char
+                        // of a line we highlight the last char instead
+                        let reverse = self.cursor_rev_range(idx);
+                        slice_styled_line(line, self.pretty_scroll_x, width, reverse)
+                    })
+                    .collect::<Vec<_>>()
             } else {
                 vec![Line::from("No body").centered()]
             };
@@ -598,12 +679,136 @@ impl<'a> ResponseViewer<'a> {
                 .into_iter()
                 .skip(self.pretty_scroll)
                 .chain(iter::repeat(Line::from("~".fg(self.colors.bright.black))))
-                .take(size.height.into())
+                .take(lines_to_show as usize)
                 .collect::<Vec<_>>();
 
             let pretty_response = Paragraph::new(lines_in_view);
             frame.render_widget(pretty_response, self.preview_layout.content_pane);
         }
+    }
+
+    /// when the visual selection is active and given line index is the line
+    /// the cursor sits on, returns the char range the cursor cell covers
+    fn cursor_rev_range(&self, line_idx: usize) -> Option<(usize, usize)> {
+        if !self.visual || line_idx.ne(&self.cursor.0) {
+            return None;
+        }
+        let lines = match self.active_tab {
+            ResViewerTabs::Preview => &self.pretty_lines,
+            _ => &self.raw_lines,
+        };
+        let line_len = lines
+            .get(line_idx)
+            .map(|line| line.chars().count())
+            .unwrap_or(0);
+        let col = self.cursor.1.min(line_len.saturating_sub(1));
+        Some((col, col.add(1)))
+    }
+
+    /// toggles the visual selection, the cursor starts at the current top
+    /// left corner of the viewport so the first motion feels predictable
+    fn toggle_visual(&mut self) {
+        self.visual = !self.visual;
+        if self.visual {
+            let (scroll_y, scroll_x) = match self.active_tab {
+                ResViewerTabs::Preview => (self.pretty_scroll, self.pretty_scroll_x),
+                _ => (self.raw_scroll, self.raw_scroll_x),
+            };
+            self.cursor = (scroll_y, scroll_x);
+            self.clamp_cursor();
+            self.anchor = self.cursor;
+        }
+    }
+
+    /// clamps the cursor to the content of the active tab; the cursor always
+    /// sits on a real char, never on the virtual end of a line, so every
+    /// motion is visible
+    fn clamp_cursor(&mut self) {
+        let lines = match self.active_tab {
+            ResViewerTabs::Preview => &self.pretty_lines,
+            _ => &self.raw_lines,
+        };
+        let last_line = lines.len().saturating_sub(1);
+        let line = self.cursor.0.min(last_line);
+        let line_len = lines
+            .get(line)
+            .map(|line| line.chars().count())
+            .unwrap_or(0);
+        self.cursor = (line, self.cursor.1.min(line_len.saturating_sub(1)));
+    }
+
+    /// moves the cursor around the content of the active tab, then makes the
+    /// viewport follow it
+    fn visual_move(&mut self, code: KeyCode) {
+        let (line, col) = self.cursor;
+        self.cursor = match code {
+            KeyCode::Char('j') => (line.add(1), col),
+            KeyCode::Char('k') => (line.saturating_sub(1), col),
+            KeyCode::Char('h') => (line, col.saturating_sub(1)),
+            KeyCode::Char('l') => (line, col.add(1)),
+            KeyCode::Char('0') => (line, 0),
+            KeyCode::Char('$') => (line, self.active_line_len(line).saturating_sub(1)),
+            _ => self.cursor,
+        };
+        self.clamp_cursor();
+        self.follow_cursor();
+    }
+
+    fn active_line_len(&self, line: usize) -> usize {
+        let lines = match self.active_tab {
+            ResViewerTabs::Preview => &self.pretty_lines,
+            _ => &self.raw_lines,
+        };
+        lines
+            .get(line)
+            .map(|line| line.chars().count())
+            .unwrap_or(0)
+    }
+
+    /// scrolls the viewport of the active tab so the cursor stays visible,
+    /// scrolling only when the cursor would move past an edge so it feels
+    /// symmetric on both sides
+    fn follow_cursor(&mut self) {
+        let height = self.preview_layout.content_pane.height as usize;
+        let width = self.viewport_width();
+        let (line, col) = self.cursor;
+
+        let (mut scroll_y, mut scroll_x) = match self.active_tab {
+            ResViewerTabs::Preview => (self.pretty_scroll, self.pretty_scroll_x),
+            ResViewerTabs::Raw => (self.raw_scroll, self.raw_scroll_x),
+            _ => return,
+        };
+
+        if line.lt(&scroll_y) {
+            scroll_y = line;
+        }
+        if line.ge(&scroll_y.add(height)) {
+            scroll_y = line.saturating_sub(height.saturating_sub(1));
+        }
+        if col.lt(&scroll_x) {
+            scroll_x = col;
+        }
+        if col.ge(&scroll_x.add(width)) {
+            scroll_x = col.saturating_sub(width.saturating_sub(1));
+        }
+
+        match self.active_tab {
+            ResViewerTabs::Preview => {
+                self.pretty_scroll = scroll_y;
+                self.pretty_scroll_x = scroll_x;
+            }
+            ResViewerTabs::Raw => {
+                self.raw_scroll = scroll_y;
+                self.raw_scroll_x = scroll_x;
+            }
+            _ => {}
+        }
+    }
+
+    /// the width of the viewport in chars, the panes render exactly this many
+    /// chars per line, borders and the vertical scrollbar excluded
+    fn viewport_width(&self) -> usize {
+        self.preview_layout.content_pane.width as usize
     }
 
     /// copies the response content to the system clipboard, flashing feedback
@@ -738,40 +943,87 @@ impl<'a> Eventful for ResponseViewer<'a> {
             return Ok(Some(ResponseViewerEvent::Quit));
         }
 
-        if let KeyCode::Esc = key_event.code {
+        // arrow keys are aliases of the hjkl motions everywhere on this pane
+        let code = match key_event.code {
+            KeyCode::Down => KeyCode::Char('j'),
+            KeyCode::Up => KeyCode::Char('k'),
+            KeyCode::Left => KeyCode::Char('h'),
+            KeyCode::Right => KeyCode::Char('l'),
+            code => code,
+        };
+
+        if let KeyCode::Esc = code {
+            // while the visual selection is active esc cancels it instead of
+            // leaving the pane
+            if self.visual {
+                self.visual = false;
+                return Ok(None);
+            }
             return Ok(Some(ResponseViewerEvent::RemoveSelection));
         }
 
-        if let KeyCode::Tab = key_event.code {
+        if let KeyCode::Char('v') = code {
+            if matches!(self.active_tab, ResViewerTabs::Preview | ResViewerTabs::Raw) {
+                self.toggle_visual();
+            }
+        }
+
+        // while the visual selection is active the motion keys move the
+        // cursor instead of scrolling, the viewport follows the cursor
+        if self.visual
+            && matches!(self.active_tab, ResViewerTabs::Preview | ResViewerTabs::Raw)
+            && matches!(
+                code,
+                KeyCode::Char('j')
+                    | KeyCode::Char('k')
+                    | KeyCode::Char('h')
+                    | KeyCode::Char('l')
+                    | KeyCode::Char('0')
+                    | KeyCode::Char('$')
+            )
+        {
+            self.visual_move(code);
+            return Ok(None);
+        }
+
+        if let KeyCode::Tab = code {
+            self.visual = false;
             self.active_tab = ResViewerTabs::next(&self.active_tab);
         }
 
         if let KeyCode::BackTab = key_event.code {
+            self.visual = false;
             self.active_tab = ResViewerTabs::prev(&self.active_tab);
         }
 
-        match key_event.code {
+        match code {
             KeyCode::Char('0') => match self.active_tab {
                 ResViewerTabs::Headers => self.headers_scroll_x = 0,
                 ResViewerTabs::Raw => self.raw_scroll_x = 0,
-                _ => {}
+                ResViewerTabs::Preview => self.pretty_scroll_x = 0,
+                ResViewerTabs::Cookies => {}
             },
             KeyCode::Char('$') => match self.active_tab {
                 ResViewerTabs::Headers => self.headers_scroll_x = usize::MAX,
                 ResViewerTabs::Raw => self.raw_scroll_x = usize::MAX,
-                _ => {}
+                ResViewerTabs::Preview => self.pretty_scroll_x = usize::MAX,
+                ResViewerTabs::Cookies => {}
             },
             KeyCode::Char('h') => match self.active_tab {
                 ResViewerTabs::Headers => {
                     self.headers_scroll_x = self.headers_scroll_x.saturating_sub(1)
                 }
                 ResViewerTabs::Raw => self.raw_scroll_x = self.raw_scroll_x.saturating_sub(1),
-                _ => {}
+                ResViewerTabs::Preview => {
+                    self.pretty_scroll_x = self.pretty_scroll_x.saturating_sub(1)
+                }
+                ResViewerTabs::Cookies => {}
             },
             KeyCode::Char('l') => match self.active_tab {
                 ResViewerTabs::Headers => self.headers_scroll_x = self.headers_scroll_x.add(1),
                 ResViewerTabs::Raw => self.raw_scroll_x = self.raw_scroll_x.add(1),
-                _ => {}
+                ResViewerTabs::Preview => self.pretty_scroll_x = self.pretty_scroll_x.add(1),
+                ResViewerTabs::Cookies => {}
             },
             KeyCode::Char('j') => match self.active_tab {
                 ResViewerTabs::Preview => self.pretty_scroll = self.pretty_scroll.add(1),
@@ -847,6 +1099,77 @@ fn build_preview_layout(size: Rect) -> PreviewLayout {
         content_pane,
         scrollbar,
     }
+}
+
+/// ratatui expects the thumb position of a scrollbar to travel all the way
+/// to `content_length - 1` to reach the end of the track, while our scroll
+/// range goes from 0 to `content - viewport`, so we remap the scroll
+/// proportionally to the full range the scrollbar expects
+fn scrollbar_position(scroll: usize, content: usize, viewport: usize) -> usize {
+    let max_scroll = content.saturating_sub(viewport);
+    if max_scroll.eq(&0) {
+        return 0;
+    }
+    scroll.min(max_scroll) * content.saturating_sub(1) / max_scroll
+}
+
+/// slices a styled line down to the `[x, x + width)` viewport, reversing the
+/// style of the `[reverse.0, reverse.1)` column range when given; all
+/// coordinates are content coordinates in char units, so the caller must
+/// clamp them to the line length beforehand
+fn slice_styled_line(
+    line: &Line<'static>,
+    x: usize,
+    width: usize,
+    reverse: Option<(usize, usize)>,
+) -> Line<'static> {
+    let (rev_start, rev_end) = reverse.unwrap_or((usize::MAX, usize::MAX));
+    let mut spans: Vec<Span> = vec![];
+    let mut col = 0;
+
+    for span in line.spans.iter() {
+        let len = span.content.chars().count();
+        if len.eq(&0) {
+            continue;
+        }
+        let (start, end) = (col, col.add(len));
+        col = end;
+
+        // overlap of this span with the viewport
+        let view_start = start.max(x);
+        let view_end = end.min(x.add(width));
+        if view_start.ge(&view_end) {
+            continue;
+        }
+
+        // the portions of the viewport overlap that fall inside/outside the
+        // reversed range, emitted in order
+        let segments = [
+            (view_start, view_end.min(rev_start), false),
+            (view_start.max(rev_start), view_end.min(rev_end), true),
+            (view_start.max(rev_end), view_end, false),
+        ];
+
+        for (seg_start, seg_end, reversed) in segments {
+            if seg_start.ge(&seg_end) {
+                continue;
+            }
+            let text: String = span
+                .content
+                .chars()
+                .skip(seg_start.sub(start))
+                .take(seg_end.sub(seg_start))
+                .collect();
+            let style = if reversed {
+                span.style.add_modifier(Modifier::REVERSED)
+            } else {
+                span.style
+            };
+            spans.push(Span::styled(text, style));
+        }
+    }
+
+    Line::from(spans)
 }
 
 fn get_error_ascii_art<R>(width: u16, rng: &mut R) -> &'static [&'static str]
