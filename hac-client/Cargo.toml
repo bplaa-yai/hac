@@ -29,6 +29,7 @@ ratatui.workspace = true
 tree-sitter.workspace = true
 divan.workspace = true
 lazy_static.workspace = true
+arboard.workspace = true
 
 futures = "0.3.30"
 tui-big-text = { version = "0.4.3" }

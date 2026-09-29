@@ -98,6 +98,7 @@ pub struct ResponseViewer<'a> {
     headers_scroll_y: usize,
     headers_scroll_x: usize,
     pretty_scroll: usize,
+    flash: Option<(String, std::time::Instant)>,
 }
 
 impl<'a> ResponseViewer<'a> {
@@ -136,6 +137,7 @@ impl<'a> ResponseViewer<'a> {
             headers_scroll_y: 0,
             headers_scroll_x: 0,
             pretty_scroll: 0,
+            flash: None,
             collection_store,
         }
     }
@@ -551,7 +553,58 @@ impl<'a> ResponseViewer<'a> {
         }
     }
 
-    fn draw_summary(&self, frame: &mut Frame, size: Rect) {
+    /// copies the response content to the system clipboard, flashing feedback
+    /// on the summary line; the source matches the active tab: the pretty
+    /// body on the preview tab, the headers as `Key: Value` lines on the
+    /// headers tab, the raw body on the raw tab; the cookies tab is still
+    /// under construction and has nothing to copy; selection-based copying
+    /// is on the way
+    fn copy_response_body(&mut self) {
+        let body = self
+            .response
+            .as_ref()
+            .and_then(|res| {
+                let res = res.borrow();
+                match self.active_tab {
+                    ResViewerTabs::Preview => res
+                        .pretty_body
+                        .as_ref()
+                        .map(|pretty| pretty.to_string())
+                        .or_else(|| res.body.clone()),
+                    ResViewerTabs::Headers => res.headers.as_ref().map(|headers| {
+                        headers
+                            .iter()
+                            .map(|(name, value)| {
+                                format!("{name}: {}", String::from_utf8_lossy(value.as_bytes()))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }),
+                    ResViewerTabs::Raw => res.body.clone(),
+                    // the cookies tab is still under construction upstream, there is
+                    // no cookie data to copy
+                    ResViewerTabs::Cookies => None,
+                }
+            });
+
+        let flash = match body {
+            Some(body) if !body.is_empty() => {
+                match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(body))
+                {
+                    Ok(()) => "Copied to clipboard".to_string(),
+                    Err(e) => {
+                        tracing::error!("failed to copy response body to clipboard: {e}");
+                        format!("Failed to copy: {e}")
+                    }
+                }
+            }
+            _ => "Nothing to copy".to_string(),
+        };
+
+        self.flash = Some((flash, std::time::Instant::now()));
+    }
+
+    fn draw_summary(&mut self, frame: &mut Frame, size: Rect) {
         if let Some(ref response) = self.response {
             let status_color = match response
                 .borrow()
@@ -569,7 +622,7 @@ impl<'a> ResponseViewer<'a> {
                     status.as_str(),
                     status
                         .canonical_reason()
-                        .expect("tried to get a canonical_reason from a invalid status code")
+                        .expect("tried to get the canonical_reason from an invalid status code")
                 )
                 .fg(status_color),
                 Some(status) => status.as_str().to_string().fg(status_color),
@@ -590,6 +643,21 @@ impl<'a> ResponseViewer<'a> {
                 pieces.push("Size: ".fg(self.colors.bright.black));
                 pieces.push(format!("{} B", size).fg(self.colors.normal.green))
             };
+
+            if let Some((message, at)) = self.flash.as_ref() {
+                if at.elapsed().lt(&std::time::Duration::from_secs(2)) {
+                    let color = if message.starts_with("Copied") {
+                        self.colors.normal.green
+                    } else {
+                        self.colors.normal.red
+                    };
+                    pieces.push(" ".into());
+                    pieces.push(" ".fg(self.colors.bright.black));
+                    pieces.push(message.clone().fg(color));
+                } else {
+                    self.flash = None;
+                }
+            }
 
             frame.render_widget(Line::from(pieces), size);
         }
@@ -660,6 +728,7 @@ impl<'a> Eventful for ResponseViewer<'a> {
                     self.headers_scroll_x = self.headers_scroll_x.add(1)
                 }
             }
+            KeyCode::Char('y') => self.copy_response_body(),
             _ => {}
         }
 
